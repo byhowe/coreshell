@@ -12,6 +12,8 @@ use wayland_client::QueueHandle;
 use wayland_client::delegate_noop;
 use wayland_client::protocol::wl_buffer;
 use wayland_client::protocol::wl_buffer::WlBuffer;
+use wayland_client::protocol::wl_callback;
+use wayland_client::protocol::wl_callback::WlCallback;
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_registry;
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -24,6 +26,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1;
 
 const HEIGHT: u32 = 30;
+const SPEED: f32 = 0.2;
 
 fn main()
 {
@@ -46,6 +49,21 @@ fn main()
     }
 }
 
+// Generate a scrolling patter.
+fn fill_scrolling_stripes(data: &mut [u32], width: usize, stripe_width: usize, offset: usize)
+{
+    const WHITE: u32 = 0xFFFFFFFF;
+    const BLACK: u32 = 0xFF000000;
+
+    let period = stripe_width * 2;
+    data.chunks_exact_mut(width).for_each(|row| {
+        row.iter_mut().enumerate().for_each(|(i, pixel)| {
+            let p = (i + offset) & period;
+            *pixel = if p < stripe_width { WHITE } else { BLACK }
+        })
+    })
+}
+
 #[derive(Default)]
 struct State
 {
@@ -57,6 +75,15 @@ struct State
     // created objects
     surface: Option<WlSurface>,
     layer_surface: Option<ZwlrLayerSurfaceV1>,
+    buffer: Option<WlBuffer>,
+
+    // pixel data
+    width: usize,
+    height: usize,
+    data: Option<*mut u32>,
+
+    last_frame_time: u32,
+    offset: f32,
 
     exit: bool,
 }
@@ -106,6 +133,7 @@ impl Dispatch<WlRegistry, ()> for State
             ) {
                 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
                 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
+
                 let layer_surface = layer_shell.get_layer_surface(
                     surface,
                     None,
@@ -152,6 +180,9 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State
 
             layer_surface.ack_configure(serial);
 
+            state.width = width as usize;
+            state.height = height as usize;
+
             let pixels = width * height;
             // Multiply by 4, because each pixel occupies 4 bytes.
             let size = pixels * 4;
@@ -162,6 +193,8 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State
             // Its size is set by ftruncate.
             ftruncate(&memfd, size as u64).unwrap();
             // Map the file descriptor into memory.
+            // FIXME: Do we need to munmap the ptr? I think we would need to munmap if we
+            // receive multiple configure events.
             let ptr = unsafe {
                 mm::mmap(
                     ptr::null_mut(),
@@ -172,12 +205,11 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State
                     0,
                 )
             }
-            .unwrap();
+            .unwrap()
+            .cast::<u32>();
+            state.data = Some(ptr);
             // Treat the raw pointer obtained by mmap as a u32 slice.
-            let data = unsafe { slice::from_raw_parts_mut(ptr.cast::<u32>(), pixels as usize) };
-
-            // Fill opaque black.
-            data.iter_mut().for_each(|pixel| *pixel = 0xFF000000);
+            let data = unsafe { slice::from_raw_parts_mut(ptr, pixels as usize) };
 
             // Create shm pool and buffer.
             // NOTE: When memfd goes out of scope at the end of this function, its drop
@@ -205,9 +237,15 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State
             // https://wayland.app/protocols/wayland#wl_shm_pool:request:create_buffer
             shm_pool.destroy();
 
+            // Initial paint. Fill with black and white blocks.
+            fill_scrolling_stripes(data, width as usize, HEIGHT as usize, 0);
+
             let surface = state.surface.as_ref().unwrap();
             surface.attach(Some(&buffer), 0, 0);
             surface.commit();
+
+            surface.frame(qh, ());
+            state.buffer = Some(buffer);
         }
     }
 }
@@ -224,8 +262,45 @@ impl Dispatch<WlBuffer, ()> for State
     )
     {
         if let wl_buffer::Event::Release = event {
-            println!("The compositor has released the buffer");
-            buffer.destroy();
+            // Compositor has done working with the buffer.
+        }
+    }
+}
+
+impl Dispatch<WlCallback, ()> for State
+{
+    fn event(
+        state: &mut Self,
+        _callback: &WlCallback,
+        event: wl_callback::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    )
+    {
+        // TODO: Is there a better way to extract the time out of this event?
+        if let wl_callback::Event::Done {
+            callback_data: time,
+        } = event
+        {
+            let surface = state.surface.as_ref().unwrap();
+
+            // Request another frame.
+            surface.frame(qh, ());
+
+            if state.last_frame_time != 0 {
+                let elapsed = (time - state.last_frame_time) as f32;
+                let period = HEIGHT * 2;
+                state.offset += elapsed * SPEED;
+                state.offset -= (period * ((state.offset as u32) / period)) as f32;
+            }
+            let size = state.width * state.height;
+            let data = unsafe { slice::from_raw_parts_mut(state.data.unwrap(), size) };
+            fill_scrolling_stripes(data, state.width, HEIGHT as usize, state.offset as usize);
+            surface.attach(state.buffer.as_ref(), 0, 0);
+            surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+            surface.commit();
+            state.last_frame_time = time;
         }
     }
 }
